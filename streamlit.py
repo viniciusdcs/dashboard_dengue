@@ -101,4 +101,3 @@ with col2:
 # Rodapé
 st.markdown("---")
 st.markdown("Dashboard desenvolvido para monitoramento de casos de dengue no Brasil. Dados obtidos do DATASUS.")
-st.markdown("Fonte: Ministério da Saúde/SVS - Sistema de Informação de Agravos de Notificação - Sinan Net")

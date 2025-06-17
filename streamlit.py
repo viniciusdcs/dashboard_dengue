@@ -1,103 +1,209 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import duckdb
 import os
+from datetime import datetime, timedelta
 
 # Configuração da página
 st.set_page_config(
-    page_title="Dashboard de Casos de Dengue",
+    page_title="Análise Temporal de Dengue",
     page_icon="🦟",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# ---------------------
-# Carregar o arquivo consolidado
-# ---------------------
+# Inicializa conexão com DuckDB
+@st.cache_resource
+def get_duckdb_connection():
+    return duckdb.connect()
+
+# Função para carregar dados com DuckDB
 @st.cache_data
-def carregar_dados():
-    pasta_dados = os.path.join(os.path.dirname(__file__), "dados_dengue")
-    arquivo_consolidado = os.path.join(pasta_dados, "dengue_consolidado.xlsx")
-    
-    if not os.path.exists(arquivo_consolidado):
-        st.error("Arquivo de dados consolidados não encontrado!")
-        st.info("Execute o script 'gerar_consolidado.py' primeiro.")
-        return None
-    
-    return pd.read_excel(arquivo_consolidado)
+def carregar_dados(query):
+    con = get_duckdb_connection()
+    return con.execute(query).df()
 
-# Carregar os dados
-df = carregar_dados()
+# Função para carregar o mapeamento de cidades
+@st.cache_data
+def carregar_mapeamento_cidades():
+    return pd.read_parquet('dengue_visualizacao/mapeamento_cidades.parquet')
 
-if df is None:
-    st.stop()
+# Função para formatar ano e semana
+def formatar_ano_semana(row):
+    return f"{row['Ano']} S{str(row['Semana']).zfill(2)}"
 
-# ---------------------
-# Sidebar - Filtros
-# ---------------------
-st.sidebar.title("Filtros")
+# Função para formatar ano e mês
+def formatar_ano_mes(row):
+    return f"{row['Ano']} M{str(row['Mes']).zfill(2)}"
 
-# Filtro de Ano para o Mapa
-anos = sorted(df["Ano"].unique(), reverse=True)
-ano_selecionado = st.sidebar.selectbox("Selecione o Ano para o Mapa", anos)
+# Função para converter ano e semana em valor numérico para ordenação
+def criar_valor_ordenacao(row):
+    if 'Semana' in row:
+        return int(f"{row['Ano']}{str(row['Semana']).zfill(2)}")
+    elif 'Mes' in row:
+        return int(f"{row['Ano']}{str(row['Mes']).zfill(2)}")
+    return int(row['Ano'])
 
-# Filtro de Estado para o Gráfico de Linha
-estados = sorted(df["Estado"].unique())
-estado_selecionado = st.sidebar.selectbox("Selecione o Estado para o Gráfico", estados)
+# Função para converter ano e mês em data
+def converter_mes_para_data(df):
+    # Garantir que Ano e Mes sejam strings com o formato correto
+    df["Data"] = pd.to_datetime(df["Ano"].astype(str) + "-" + df["Mes"].astype(str).str.zfill(2) + "-01")
+    return df
 
-# ---------------------
-# Dashboard principal
-# ---------------------
-st.title("Dashboard de Casos de Dengue no Brasil")
+# Título da aplicação
+st.title("Análise Temporal de Casos de Dengue")
 
-# Layout de duas colunas para os gráficos
-col1, col2 = st.columns(2)
+# Sidebar com filtros
+st.sidebar.header("Filtros")
 
-# Filtrar dados para o ano selecionado (para o mapa)
-df_ano = df[df["Ano"] == ano_selecionado]
+# Carregar mapeamento de cidades
+df_cidades = carregar_mapeamento_cidades()
 
-with col1:
-    # Mapa de casos por estado
-    st.subheader(f"Casos de Dengue por Estado - {ano_selecionado}")
-    
-    fig_mapa = px.choropleth(
-        df_ano,
-        geojson="https://raw.githubusercontent.com/codeforamerica/click_that_hood/master/public/data/brazil-states.geojson",
-        locations="UF",  
-        featureidkey="properties.sigla",
-        color="Total de Casos",
-        color_continuous_scale="Reds",
-        scope="south america",
-        labels={"Total de Casos": "Casos de Dengue"}
+# Lista de estados
+estados = [os.path.splitext(f)[0] for f in os.listdir("dengue_com_taxa") if f.endswith('.parquet')]
+estado_selecionado = st.sidebar.selectbox("Selecione o Estado", ["Todos"] + sorted(estados))
+
+# Lista de cidades do estado selecionado
+cidades = []
+if estado_selecionado != "Todos":
+    # Carregar dados do estado selecionado
+    query_cidades = f"""
+    SELECT DISTINCT Municipio
+    FROM 'dengue_com_taxa/{estado_selecionado}.parquet'
+    ORDER BY Municipio
+    """
+    df_cidades_estado = carregar_dados(query_cidades)
+    cidades = df_cidades_estado['Municipio'].unique().tolist()
+    cidade_selecionada = st.sidebar.selectbox("Selecione a Cidade", ["Todas"] + sorted(cidades))
+
+# Seleção da granularidade
+granularidade = st.sidebar.selectbox("Escolha a granularidade (Frequência)", ["Semanal", "Mensal", "Anual"])
+
+# Seleção do tipo de dado
+tipo_dado = st.sidebar.radio("Selecione o tipo de dado", ["Casos", "Taxa"])
+
+# Preparar a query base
+if estado_selecionado == "Todos":
+    arquivo = "dengue_visualizacao/totais_geral.parquet"
+else:
+    arquivo = f"dengue_com_taxa/{estado_selecionado}.parquet"
+
+# Construir a query de acordo com a granularidade e filtros
+filtro_cidade = ""
+if estado_selecionado != "Todos" and 'cidade_selecionada' in locals() and cidade_selecionada != "Todas":
+    filtro_cidade = f" AND \"Municipio\" = '{cidade_selecionada}'"
+
+coluna_valor = "Casos" if tipo_dado == "Casos" else "Taxa"
+
+if granularidade == "Semanal":
+    query = f"""
+    SELECT 
+        Ano,
+        Semana,
+        SUM({coluna_valor}) as {coluna_valor}
+    FROM '{arquivo}'
+    WHERE 1=1 {filtro_cidade}
+    GROUP BY Ano, Semana
+    ORDER BY Ano, Semana
+    """
+    df_temporal = carregar_dados(query)
+    df_temporal["Período"] = df_temporal['Semana']
+    eixo_x = "Período"
+    titulo_x = "Ano-Semana"
+elif granularidade == "Mensal":
+    query = f"""
+    SELECT 
+        Ano,
+        Mes,
+        SUM({coluna_valor}) as {coluna_valor}
+    FROM '{arquivo}'
+    WHERE 1=1 {filtro_cidade}
+    GROUP BY Ano, Mes
+    ORDER BY Ano, Mes
+    """
+    df_temporal = carregar_dados(query)
+    df_temporal["Período"] = df_temporal['Mes']
+    eixo_x = "Período"
+    titulo_x = "Ano-Mês"
+else:  # Anual
+    query = f"""
+    SELECT 
+        Ano,
+        SUM({coluna_valor}) as {coluna_valor}
+    FROM '{arquivo}'
+    WHERE 1=1 {filtro_cidade}
+    GROUP BY Ano
+    ORDER BY Ano
+    """
+    df_temporal = carregar_dados(query)
+    df_temporal["Período"] = df_temporal["Ano"].astype(str)
+    eixo_x = "Período"
+    titulo_x = "Ano"
+
+# Criar título do gráfico
+if estado_selecionado == "Todos":
+    titulo_grafico = f"{tipo_dado} de Dengue por {granularidade} - Brasil"
+elif 'cidade_selecionada' in locals() and cidade_selecionada != "Todas":
+    titulo_grafico = f"{tipo_dado} de Dengue por {granularidade} - {cidade_selecionada} ({estado_selecionado})"
+else:
+    titulo_grafico = f"{tipo_dado} de Dengue por {granularidade} - {estado_selecionado}"
+
+# Criar gráfico
+fig = px.line(
+    df_temporal, 
+    x=eixo_x, 
+    y=coluna_valor,
+    title=titulo_grafico,
+    labels={coluna_valor: f"Número de {tipo_dado}", eixo_x: titulo_x}
+)
+
+# Melhorar formatação do eixo X
+if granularidade == "Semanal":
+    fig.update_xaxes(
+        tickangle=45,
+        nticks=20
     )
-    
-    fig_mapa.update_geos(fitbounds="locations", visible=False)
-    fig_mapa.update_layout(height=500)
-    st.plotly_chart(fig_mapa, use_container_width=True)
-
-# Filtrar dados para o estado selecionado (para o gráfico de linha)
-df_estado = df[df["Estado"] == estado_selecionado].sort_values("Ano")
-
-with col2:
-    # Gráfico de linha por ano para o estado selecionado
-    st.subheader(f"Evolução de Casos em {estado_selecionado}")
-    
-    fig_linha = px.line(
-        df_estado,
-        x="Ano", 
-        y="Total de Casos",
-        markers=True,
-        title=f"Casos de Dengue por Ano - {estado_selecionado}"
+elif granularidade == "Mensal":
+    fig.update_xaxes(
+        tickangle=45,
+        nticks=15
     )
-    
-    fig_linha.update_layout(
-        xaxis_title="Ano",
-        yaxis_title="Total de Casos",
-        height=500
+else:
+    fig.update_xaxes(
+        tickangle=45
     )
-    
-    st.plotly_chart(fig_linha, use_container_width=True)
 
-# Rodapé
-st.markdown("---")
-st.markdown("Dashboard desenvolvido para monitoramento de casos de dengue no Brasil. Dados obtidos do DATASUS.")
+# Exibir gráfico
+st.plotly_chart(fig, use_container_width=True)
+
+# Estatísticas
+st.header("Estatísticas")
+
+col1, col2, col3 = st.columns(3)
+
+# Total
+total = df_temporal[coluna_valor].sum()
+col1.metric(f"Total de {tipo_dado}", f"{total:,.2f}" if tipo_dado == "Taxa" else f"{int(total):,}")
+
+# Média por período
+media_periodo = df_temporal[coluna_valor].mean()
+col2.metric(f"Média por período ({granularidade.lower()})", f"{media_periodo:,.2f}" if tipo_dado == "Taxa" else f"{int(media_periodo):,}")
+
+# Período com maior valor
+max_periodo = df_temporal.loc[df_temporal[coluna_valor].idxmax()]
+col3.metric(f"Período com maior {tipo_dado.lower()}", f"{max_periodo['Período']}: {max_periodo[coluna_valor]:,.2f}" if tipo_dado == "Taxa" else f"{max_periodo['Período']}: {int(max_periodo[coluna_valor]):,}")
+
+# Exibir dados brutos
+with st.expander("Ver Dados"):
+    df_display = df_temporal[["Período", coluna_valor]]
+    st.dataframe(df_display)
+
+# Adicionar informações sobre os dados
+st.sidebar.markdown("---")
+st.sidebar.info("""
+**Sobre os Dados**
+- Dados organizados por estado e município
+- Período: 2014 a 2025
+- Granularidades disponíveis: Semanal, Mensal e Anual
+- Fonte: Datasus - Ministério da Saúde
+""") 
